@@ -1,5 +1,5 @@
 {
-  description = "Development environment for the LiteLLM proxy";
+  description = "LiteLLM proxy: dev shell and runnable package";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -7,6 +7,15 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs { inherit system; }));
+
+      litellmVersion = "1.99.0"; # keep in sync with pyproject.toml [project] version
+
+      # Hashes of the wheelhouse per platform. To add a platform (or after
+      # uv.lock/pyproject changes), set `nixpkgs.lib.fakeHash` for it, run
+      # `nix build .#wheels`, and record the "got: sha256-..." from the error.
+      venvHashes = {
+        x86_64-linux = "sha256-N7BY+iixKWsHxjb+8wHr7yFH/LBHldnV7xZqlw5KWA8=";
+      };
       # Prisma derives the platform from /etc/os-release ("linux-nixos"), for which
       # binaries.prisma.sh publishes no engines (404). Pin the glibc build for the
       # commit locked by prisma==0.11.0 in uv.lock (JS CLI 5.4.2), repoint its RPATH
@@ -45,8 +54,142 @@
             done
           '';
         };
+      # Runnable-package plumbing. The litellm runtime env (uv.lock, base +
+      # proxy extra) is resolved in three steps:
+      #
+      # 1. litellmWheels (fixed-output derivation — FODs are the only builds
+      #    allowed network): `uv export` the pinned requirements and download
+      #    every wheel. Only downloads: a FOD's output must not reference
+      #    store paths, so the venv itself cannot be built here.
+      # 2. litellmVenv (normal derivation): create a venv on nix python312 and
+      #    `uv pip install` strictly from the wheelhouse. The litellm package
+      #    itself is copied in by hand: installing the root via uv would run
+      #    maturin (Rust build) for a pyo3 extension that is optional at
+      #    runtime — the loader (litellm/rust_bridge/loader.py) falls back to
+      #    pure Python when `_native` is missing. Same for the pure-python
+      #    workspace members, whose uv_build backend cannot bootstrap inside a
+      #    sandbox (it shells out to an interpreter that is never installed).
+      # 3. litellm: `litellm` CLI wrapper.
+      litellmWheels = pkgs:
+        let
+          pip-python = pkgs.python312.withPackages (ps: [ ps.pip ]);
+        in
+        pkgs.stdenvNoCC.mkDerivation {
+          pname = "litellm-wheels";
+          version = litellmVersion;
+          src = self;
+          outputHashAlgo = "sha256";
+          outputHashMode = "recursive";
+          outputHash = venvHashes.${pkgs.stdenv.hostPlatform.system} or (throw "litellm-wheels: no hash recorded for ${pkgs.stdenv.hostPlatform.system}; see venvHashes comment in flake.nix");
+          dontConfigure = true;
+          dontBuild = true;
+          nativeBuildInputs = [ pkgs.uv pip-python pkgs.cacert ];
+          installPhase = ''
+            runHook preInstall
+            export HOME=$TMPDIR
+            export UV_CACHE_DIR=$TMPDIR/uv-cache
+            export UV_PYTHON_DOWNLOADS=never
+            export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+            mkdir -p $out/wheels
+            # stdout, comments stripped: uv's header echoes the -o path,
+            # which would make the FOD reference its own $out
+            uv export \
+              --frozen \
+              --no-dev \
+              --extra proxy \
+              --no-emit-workspace \
+              --no-hashes \
+              -o - | grep -v '^#' > $out/requirements.txt
+            ${pip-python}/bin/python -m pip download \
+              --no-deps \
+              --only-binary :all: \
+              --no-cache-dir \
+              -r $out/requirements.txt \
+              -d $out/wheels
+            runHook postInstall
+          '';
+        };
+      litellmVenv = pkgs:
+        pkgs.stdenvNoCC.mkDerivation {
+          pname = "litellm-venv";
+          version = litellmVersion;
+          src = self;
+          dontConfigure = true;
+          dontBuild = true;
+          nativeBuildInputs = [ pkgs.uv pkgs.python312 ];
+          installPhase = ''
+            runHook preInstall
+            export HOME=$TMPDIR
+            export UV_CACHE_DIR=$TMPDIR/uv-cache
+            export UV_PYTHON_DOWNLOADS=never
+            uv venv $out/venv --python ${pkgs.python312}/bin/python3
+            uv pip install \
+              --python $out/venv/bin/python \
+              --offline \
+              --no-index \
+              --find-links ${litellmWheels pkgs}/wheels \
+              -r ${litellmWheels pkgs}/requirements.txt
+            site=$out/venv/lib/python3.12/site-packages
+            # litellm package, as the maturin wheel would ship it: without the
+            # proxy/enterprise subtree ([tool.maturin] exclude) and _native.
+            # Versions of the dist-info stubs follow pyproject/uv.lock.
+            cp -r litellm $site/litellm
+            rm -rf $site/litellm/proxy/enterprise
+            cp -r enterprise/litellm_enterprise $site/litellm_enterprise
+            cp -r litellm-proxy-extras/litellm_proxy_extras $site/litellm_proxy_extras
+            mkdir -p $site/litellm-${litellmVersion}.dist-info $site/litellm_enterprise-0.1.59.dist-info $site/litellm_proxy_extras-0.4.89.dist-info
+            printf 'Metadata-Version: 2.1\nName: litellm\nVersion: ${litellmVersion}\n' > $site/litellm-${litellmVersion}.dist-info/METADATA
+            printf 'Metadata-Version: 2.1\nName: litellm-enterprise\nVersion: 0.1.59\n' > $site/litellm_enterprise-0.1.59.dist-info/METADATA
+            printf 'Metadata-Version: 2.1\nName: litellm-proxy-extras\nVersion: 0.4.89\n' > $site/litellm_proxy_extras-0.4.89.dist-info/METADATA
+            # local wheel installs embed the store path; drop provenance
+            find $site -name direct_url.json -delete
+            find $site/litellm $site/litellm_enterprise $site/litellm_proxy_extras -name __pycache__ -type d -prune -exec rm -rf {} +
+            # console script for the `litellm` entry point (litellm:run_server)
+            cat > $out/venv/bin/litellm <<EOF
+#!$out/venv/bin/python
+import sys
+from litellm import run_server
+run_server(sys.argv[1:])
+EOF
+            chmod +x $out/venv/bin/litellm
+            runHook postInstall
+          '';
+        };
+      # `litellm` CLI wrapper. LD_LIBRARY_PATH: prebuilt C-extension wheels
+      # (tokenizers, orjson, pydantic-core, ...) need libstdc++/libgcc_s,
+      # which nix stdenv does not put on the default library search path.
+      litellm = pkgs:
+        let
+          venv = litellmVenv pkgs;
+          gccRuntimeLib = if (pkgs.stdenv.cc ? cc) && (pkgs.stdenv.cc.cc ? lib) then pkgs.stdenv.cc.cc.lib else null;
+        in
+        pkgs.writeShellScriptBin "litellm" (
+          (pkgs.lib.optionalString (gccRuntimeLib != null) ''
+            export LD_LIBRARY_PATH="${gccRuntimeLib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          '')
+          + ''
+            exec "${venv}/venv/bin/litellm" "$@"
+          ''
+        );
     in
     {
+      packages = nixpkgs.lib.genAttrs (builtins.attrNames venvHashes) (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          litellm' = litellm pkgs;
+        in
+        {
+          litellm = litellm';
+          venv = litellmVenv pkgs;
+          wheels = litellmWheels pkgs;
+          default = litellm';
+        });
+      apps = nixpkgs.lib.genAttrs (builtins.attrNames venvHashes) (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/litellm";
+        };
+      });
       devShells = forAllSystems (pkgs:
         let
           isX8664Linux = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
