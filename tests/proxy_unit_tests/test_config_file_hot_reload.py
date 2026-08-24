@@ -467,3 +467,89 @@ def test_master_key_rotation_invalidates_cached_identity(client_master_key):
     assert old.status_code in (400, 401)
     assert ps.user_api_key_cache.get_cache(key=ps.hash_token("mk-v1")) is None
     assert _auth_passed(client.post("/chat/completions", json=CHAT_BODY, headers={"Authorization": "Bearer mk-v2"}))
+
+
+@pytest.fixture(scope="function")
+def client_signup_enabled(tmp_path, monkeypatch):
+    config_path = os.path.join(tmp_path, "config.yaml")
+    with open(os.path.join(tmp_path, "custom_auth.py"), "w") as f:
+        f.write(SCRIPT_V1)
+    with open(config_path, "w") as f:
+        f.write(
+            _config_yaml(custom_auth="custom_auth.user_api_key_auth")
+            + "  enable_static_token_signup: true\n"
+        )
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
+    asyncio.run(initialize(config=config_path, debug=True))
+    return TestClient(app), os.path.join(tmp_path, "custom_auth.py")
+
+
+def test_signup_registers_new_static_token(client_signup_enabled):
+    client, script_path = client_signup_enabled
+
+    response = client.post("/signup/carol")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["username"] == "carol"
+    token = body["token"]
+    assert token.startswith("sk-carol-")
+
+    # the entry is persisted in the script's token table
+    with open(script_path) as f:
+        script_source = f.read()
+    assert token in script_source
+
+    # and is live immediately (no restart, no manual reload)
+    assert _auth_passed(
+        client.post(
+            "/chat/completions",
+            json=CHAT_BODY,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    )
+
+    # a second, distinct signup also works and stays live
+    response2 = client.post("/signup/dave")
+    assert response2.status_code == 200
+    token2 = response2.json()["token"]
+    assert _auth_passed(
+        client.post(
+            "/chat/completions",
+            json=CHAT_BODY,
+            headers={"Authorization": f"Bearer {token2}"},
+        )
+    )
+    assert _auth_passed(
+        client.post(
+            "/chat/completions",
+            json=CHAT_BODY,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    )
+
+
+def test_signup_rejects_already_registered(client_signup_enabled):
+    client, _ = client_signup_enabled
+
+    # username registered by a prior signup
+    first = client.post("/signup/carol")
+    assert first.status_code == 200
+    duplicate = client.post("/signup/carol")
+    assert duplicate.status_code == 409
+    assert "username carol already registered" in duplicate.text
+
+    # username pre-existing in the script's table
+    pre_existing = client.post("/signup/alice")
+    assert pre_existing.status_code == 409
+    assert "username alice already registered" in pre_existing.text
+
+
+def test_signup_rejects_invalid_username(client_signup_enabled):
+    client, _ = client_signup_enabled
+    assert client.post("/signup/bad%20name").status_code == 400
+    assert client.post("/signup/" + "x" * 65).status_code == 400
+
+
+def test_signup_disabled_by_default(client_custom_auth):
+    client = client_custom_auth
+    assert client.post("/signup/dave").status_code == 404

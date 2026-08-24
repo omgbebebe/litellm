@@ -382,6 +382,12 @@ from litellm.proxy.common_utils.scheduled_job_stagger import (
     parse_stagger_settings,
     stagger_trigger,
 )
+from litellm.proxy.common_utils.static_token_store import (
+    StaticTokenError,
+    UsernameAlreadyRegistered,
+    append_static_token,
+    is_valid_signup_username,
+)
 from litellm.proxy.common_utils.swagger_utils import ERROR_RESPONSES
 from litellm.proxy.common_utils.timezone_utils import (
     get_budget_reset_settings,
@@ -619,8 +625,10 @@ from litellm.proxy.spend_tracking.spend_management_endpoints import (
 )
 from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
 from litellm.proxy.types_utils.utils import (
+    get_importable_script_path,
     get_instance_fn,
     reload_importable_script_module,
+    resolve_local_script_path,
 )
 from litellm.proxy.ui_crud_endpoints.proxy_setting_endpoints import (
     router as ui_crud_endpoints_router,
@@ -17417,6 +17425,77 @@ async def reload_config_file(
         verbose_proxy_logger.exception("Failed to reload config file: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to reload config file: {e}")
     return outcome.model_dump()
+
+
+_static_token_signup_lock: Final = asyncio.Lock()
+
+
+@router.post(
+    "/signup/{username}",
+    tags=["config.yaml"],  # mutable-ok: FastAPI route metadata
+    include_in_schema=False,
+)
+async def signup_static_token(username: str):
+    """Register `username` in the static-token `custom_auth` script: append a
+    fresh token entry to the script's `STATIC_TOKENS` dict and hot-reload it,
+    so the returned token authenticates immediately. 409 when the username
+    has an entry already. Unauthenticated by design — enable explicitly via
+    `general_settings.enable_static_token_signup: true` (default off), only
+    for deployments where that trade-off is acceptable. Requires
+    `custom_auth` to point at a local script file (not s3://gcs://)."""
+    if not general_settings.get("enable_static_token_signup", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    if not is_valid_signup_username(username):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid username: use 1-64 letters, digits, '.', '_', '-', '@'",
+        )
+
+    custom_auth_ref: Final = general_settings.get("custom_auth")
+    if not isinstance(custom_auth_ref, str) or custom_auth_ref.startswith(("s3://", "gcs://")):
+        raise HTTPException(
+            status_code=400,
+            detail="static-token signup requires a local custom_auth script (got no or a remote custom_auth setting)",
+        )
+    script_path: Final = (
+        resolve_local_script_path(custom_auth_ref, user_config_file_path)
+        or get_importable_script_path(custom_auth_ref)
+    )
+    if script_path is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"custom_auth script file not found for '{custom_auth_ref}'",
+        )
+
+    token: Final = f"sk-{username}-{secrets.token_hex(16)}"
+    async with _static_token_signup_lock:  # in-process only; multi-worker deployments race on the file
+        try:
+            with open(script_path, "r", encoding="utf-8") as f:
+                source: Final = f.read()
+            updated_source: Final = append_static_token(source, token=token, username=username)
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(updated_source)
+        except UsernameAlreadyRegistered:
+            raise HTTPException(
+                status_code=409, detail=f"username {username} already registered"
+            )
+        except StaticTokenError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"cannot update custom_auth script: {e}")
+
+        # apply now so the token is live for the request that follows the
+        # signup reply; the poll retries if this transiently fails
+        outcome = await proxy_config.check_config_file_reload()
+        if outcome.fatal_error is not None or outcome.section_errors:
+            verbose_proxy_logger.error(
+                "signup: token written but reload reported issues (the poll will retry): fatal=%s errors=%s",
+                outcome.fatal_error,
+                outcome.section_errors,
+            )
+
+    verbose_proxy_logger.info("signup: registered username %s", username)
+    return {"username": username, "token": token}
 
 
 @router.post(
