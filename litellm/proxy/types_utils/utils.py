@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import importlib.util
 import os
+import sys
 from collections.abc import Callable
 from typing import Any, Final, Literal, get_type_hints
 
@@ -14,10 +15,57 @@ def resolve_local_script_path(value: str, config_file_path: str | None = None) -
     """
     if config_file_path is None or value.startswith(("s3://", "gcs://")) or "." not in value:
         return None
-    module_file_path: Final = os.path.join(
-        os.path.dirname(config_file_path), *value.split(".")[:-1]
-    ) + ".py"
+    module_file_path: Final = os.path.join(os.path.dirname(config_file_path), *value.split(".")[:-1]) + ".py"
     return module_file_path if os.path.exists(module_file_path) else None
+
+
+def get_importable_script_path(value: str) -> str | None:
+    """
+    Resolve a ``module.instance`` reference to the local ``.py`` file backing
+    the importable module (via ``sys.path``), or ``None`` when the reference
+    is remote, not dotted, not importable, or not backed by a local file
+    (namespace/builtin/frozen modules). Used to hot-reload-monitor scripts
+    that live away from the config file.
+    """
+    if value.startswith(("s3://", "gcs://")) or "." not in value:
+        return None
+    module_name: Final = value.rsplit(".", 1)[0]
+    try:
+        spec: Final = importlib.util.find_spec(module_name)
+    except (ImportError, AttributeError, ValueError):
+        return None
+    if spec is None or spec.origin is None:
+        return None
+    origin: Final = spec.origin
+    return origin if origin.endswith(".py") and os.path.isfile(origin) else None
+
+
+def reload_importable_script_module(value: str) -> None:
+    """
+    Re-execute the already-imported module backing a ``module.instance``
+    reference from its file, busting the ``sys.modules`` cache so a config
+    hot-reload picks up script edits. The source is compiled and executed
+    directly into the live module object — ``importlib.reload`` and
+    ``spec_from_file_location`` consult the ``__pycache__`` bytecode, whose
+    second-granularity mtime + size check can miss a same-length edit made
+    within the same second. No-op for remote refs, modules not yet imported
+    (their first import executes fresh code anyway), and modules not backed
+    by a local ``.py`` file.
+    """
+    if value.startswith(("s3://", "gcs://")) or "." not in value:
+        return
+    module_name: Final = value.rsplit(".", 1)[0]
+    module: Final = sys.modules.get(module_name)
+    if module is None:
+        return
+    spec: Final = getattr(module, "__spec__", None)
+    origin: Final = getattr(spec, "origin", None)
+    if spec is None or origin is None or not origin.endswith(".py") or not os.path.isfile(origin):
+        return
+    with open(origin, "rb") as f:
+        source: Final = f.read()
+    code: Final = compile(source, origin, "exec")
+    exec(code, module.__dict__)  # noqa: S102 - rebind the live module in place
 
 
 def get_instance_fn(value: str, config_file_path: str | None = None) -> Any:

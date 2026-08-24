@@ -129,6 +129,70 @@ def client_master_key(tmp_path, monkeypatch):
     return TestClient(app), config_path
 
 
+@pytest.fixture(scope="function")
+def client_importable_custom_auth(tmp_path, monkeypatch):
+    """custom_auth module importable via sys.path (e.g. PYTHONPATH=/app in
+    the Docker images), living away from the config file."""
+    import sys
+
+    script_dir = os.path.join(tmp_path, "auth_src")
+    os.makedirs(script_dir, exist_ok=True)
+    script_path = os.path.join(script_dir, "hot_reload_import_auth.py")
+    with open(script_path, "w") as f:
+        f.write(SCRIPT_V1)
+    config_path = os.path.join(tmp_path, "config.yaml")
+    with open(config_path, "w") as f:
+        f.write(_config_yaml(custom_auth="hot_reload_import_auth.user_api_key_auth"))
+    monkeypatch.syspath_prepend(script_dir)
+    monkeypatch.delitem(sys.modules, "hot_reload_import_auth", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
+    asyncio.run(initialize(config=config_path, debug=True))
+    return TestClient(app), script_path
+
+
+def test_importable_custom_auth_script_hot_swap_without_restart(
+    client_importable_custom_auth,
+):
+    """Editing the importable module's file (YAML pointer unchanged) triggers
+    a fingerprint change and swaps the request-time auth handler, bypassing
+    the sys.modules cache."""
+    client, script_path = client_importable_custom_auth
+
+    assert _auth_passed(
+        client.post(
+            "/chat/completions",
+            json=CHAT_BODY,
+            headers={"Authorization": "Bearer sk-user-bob-key-456"},
+        )
+    )
+
+    with open(script_path, "w") as f:
+        f.write(SCRIPT_V2)
+    reload_report = client.post("/reload/config_file", headers=ADMIN_HEADERS)
+    assert reload_report.status_code == 200
+    report = reload_report.json()
+    assert report["reloaded"] is True
+    assert report["applied_scripts"] == ["custom_auth"]
+    assert report["fatal_error"] is None
+
+    # v2 token table is live; the v1-only key no longer authenticates
+    assert _auth_passed(
+        client.post(
+            "/chat/completions",
+            json=CHAT_BODY,
+            headers={"Authorization": "Bearer sk-user-carol-key-789"},
+        )
+    )
+    assert (
+        client.post(
+            "/chat/completions",
+            json=CHAT_BODY,
+            headers={"Authorization": "Bearer sk-user-bob-key-456"},
+        ).status_code
+        == 401
+    )
+
+
 def test_custom_auth_script_hot_swap_without_restart(client_custom_auth):
     client = client_custom_auth
 
@@ -202,8 +266,9 @@ def test_custom_auth_script_hot_swap_without_restart(client_custom_auth):
     # fixing the script lets the retry succeed
     with open(_script_path(), "w") as f:
         f.write(
-            SCRIPT_V2.replace("sk-user-carol-key-789", "sk-user-dave-key-000")
-            .replace('"user_id": "carol"', '"user_id": "dave"')
+            SCRIPT_V2.replace("sk-user-carol-key-789", "sk-user-dave-key-000").replace(
+                '"user_id": "carol"', '"user_id": "dave"'
+            )
         )
     fixed_report = client.post("/reload/config_file", headers=ADMIN_HEADERS)
     fixed = fixed_report.json()
@@ -222,9 +287,7 @@ def test_master_key_rotation_invalidates_cached_identity(client_master_key):
     client, config_path = client_master_key
     import litellm.proxy.proxy_server as ps
 
-    assert _auth_passed(
-        client.post("/chat/completions", json=CHAT_BODY, headers={"Authorization": "Bearer mk-v1"})
-    )
+    assert _auth_passed(client.post("/chat/completions", json=CHAT_BODY, headers={"Authorization": "Bearer mk-v1"}))
     wrong = client.post(
         "/chat/completions",
         json=CHAT_BODY,
@@ -262,6 +325,4 @@ def test_master_key_rotation_invalidates_cached_identity(client_master_key):
     )
     assert old.status_code in (400, 401)
     assert ps.user_api_key_cache.get_cache(key=ps.hash_token("mk-v1")) is None
-    assert _auth_passed(
-        client.post("/chat/completions", json=CHAT_BODY, headers={"Authorization": "Bearer mk-v2"})
-    )
+    assert _auth_passed(client.post("/chat/completions", json=CHAT_BODY, headers={"Authorization": "Bearer mk-v2"}))

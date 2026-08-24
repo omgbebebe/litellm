@@ -19,7 +19,6 @@ from litellm.proxy.common_utils.config_file_reload import (
 )
 from litellm.proxy.types_utils.utils import resolve_local_script_path
 
-
 # ---------------------------------------------------------------------------
 # resolve_local_script_path
 # ---------------------------------------------------------------------------
@@ -31,9 +30,7 @@ def test_resolve_local_script_path_resolves_file_next_to_config(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("")
 
-    assert resolve_local_script_path("custom_auth.user_api_key_auth", str(config)) == str(
-        script
-    )
+    assert resolve_local_script_path("custom_auth.user_api_key_auth", str(config)) == str(script)
 
 
 def test_resolve_local_script_path_nested_module(tmp_path):
@@ -43,9 +40,7 @@ def test_resolve_local_script_path_nested_module(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("")
 
-    assert resolve_local_script_path("my.script.fn", str(config)) == str(
-        nested / "script.py"
-    )
+    assert resolve_local_script_path("my.script.fn", str(config)) == str(nested / "script.py")
 
 
 @pytest.mark.parametrize(
@@ -57,9 +52,7 @@ def test_resolve_local_script_path_nested_module(tmp_path):
         ("no_dot_string", "/some/config.yaml"),
     ],
 )
-def test_resolve_local_script_path_returns_none_when_not_local(
-    value, config_file_path
-):
+def test_resolve_local_script_path_returns_none_when_not_local(value, config_file_path):
     assert resolve_local_script_path(value, config_file_path) is None
 
 
@@ -67,6 +60,76 @@ def test_resolve_local_script_path_returns_none_when_file_missing(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("")
     assert resolve_local_script_path("missing.module.fn", str(config)) is None
+
+
+# ---------------------------------------------------------------------------
+# get_importable_script_path / reload_importable_script_module
+# ---------------------------------------------------------------------------
+
+
+def test_get_importable_script_path_resolves_syspath_module(tmp_path, monkeypatch):
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    (script_dir / "hot_reload_auth_mod.py").write_text("TOKEN = 'v1'\n")
+    monkeypatch.syspath_prepend(str(script_dir))
+
+    from litellm.proxy.types_utils.utils import get_importable_script_path
+
+    assert get_importable_script_path("hot_reload_auth_mod.user_api_key_auth") == str(
+        script_dir / "hot_reload_auth_mod.py"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "s3://bucket/key.py.handler",
+        "gcs://bucket/key.py.handler",
+        "no_dot_string",
+        "not_a_real_module_xyz.attr",
+    ],
+)
+def test_get_importable_script_path_returns_none_when_unresolvable(value):
+    from litellm.proxy.types_utils.utils import get_importable_script_path
+
+    assert get_importable_script_path(value) is None
+
+
+def test_reload_importable_script_module_reexecutes_edited_file(tmp_path, monkeypatch):
+    import sys
+
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    module_path = script_dir / "hot_reload_reexec_mod.py"
+    module_path.write_text("TOKEN = 'v1'\n")
+    monkeypatch.syspath_prepend(str(script_dir))
+    monkeypatch.delitem(sys.modules, "hot_reload_reexec_mod", raising=False)
+
+    import hot_reload_reexec_mod
+
+    assert hot_reload_reexec_mod.TOKEN == "v1"
+
+    from litellm.proxy.types_utils.utils import reload_importable_script_module
+
+    module_path.write_text("TOKEN = 'v2'\n")
+    assert hot_reload_reexec_mod.TOKEN == "v1"  # sys.modules cache
+    reload_importable_script_module("hot_reload_reexec_mod.TOKEN")
+    assert hot_reload_reexec_mod.TOKEN == "v2"
+
+
+def test_reload_importable_script_module_noop_for_unimported_module(tmp_path, monkeypatch):
+    import sys
+
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    (script_dir / "hot_reload_unimported_mod.py").write_text("TOKEN = 'v1'\n")
+    monkeypatch.syspath_prepend(str(script_dir))
+    monkeypatch.delitem(sys.modules, "hot_reload_unimported_mod", raising=False)
+
+    from litellm.proxy.types_utils.utils import reload_importable_script_module
+
+    reload_importable_script_module("hot_reload_unimported_mod.attr")  # must not raise
+    assert "hot_reload_unimported_mod" not in sys.modules
 
 
 # ---------------------------------------------------------------------------
@@ -94,13 +157,11 @@ def test_compute_source_fingerprint_includes_remote_refs(tmp_path):
     f1 = tmp_path / "a.yaml"
     f1.write_text("a: 1\n")
 
-    assert (
-        compute_source_fingerprint(file_paths=[str(f1)], remote_refs=["s3://b/m.f"])
-        != compute_source_fingerprint(file_paths=[str(f1)], remote_refs=["s3://b/m.g"])
+    assert compute_source_fingerprint(file_paths=[str(f1)], remote_refs=["s3://b/m.f"]) != compute_source_fingerprint(
+        file_paths=[str(f1)], remote_refs=["s3://b/m.g"]
     )
-    assert (
-        compute_source_fingerprint(file_paths=[str(f1)])
-        != compute_source_fingerprint(file_paths=[str(f1)], remote_refs=["s3://b/m.f"])
+    assert compute_source_fingerprint(file_paths=[str(f1)]) != compute_source_fingerprint(
+        file_paths=[str(f1)], remote_refs=["s3://b/m.f"]
     )
 
 
@@ -127,9 +188,7 @@ def test_parsed_config_fingerprint_handles_non_serializable_values():
         def __str__(self) -> str:
             return "marker"
 
-    assert compute_parsed_config_fingerprint({"k": Marker()}) == compute_parsed_config_fingerprint(
-        {"k": "marker"}
-    )
+    assert compute_parsed_config_fingerprint({"k": Marker()}) == compute_parsed_config_fingerprint({"k": "marker"})
 
 
 # ---------------------------------------------------------------------------
@@ -170,9 +229,7 @@ def test_collect_components_missing_include_raises(tmp_path):
     main.write_text("include:\n  - missing.yaml\n")
 
     with pytest.raises(FileNotFoundError, match="missing.yaml"):
-        collect_config_source_components(
-            config={"include": ["missing.yaml"]}, config_file_path=str(main)
-        )
+        collect_config_source_components(config={"include": ["missing.yaml"]}, config_file_path=str(main))
 
 
 def test_collect_components_remote_script_refs(tmp_path):
@@ -202,6 +259,78 @@ def test_collect_components_ignores_importable_scripts(tmp_path):
     )
     assert refs == ()
     assert len(files) == 1
+
+
+def test_collect_components_includes_importable_script_file(tmp_path, monkeypatch):
+    """A `module.instance` ref whose module is importable from sys.path (and
+    has no file next to the config) is monitored via the module's file."""
+    import sys
+
+    main = tmp_path / "config.yaml"
+    main.write_text("")
+    script_dir = tmp_path / "auth_src"
+    script_dir.mkdir()
+    script = script_dir / "hot_reload_collect_mod.py"
+    script.write_text("TOKEN = 'v1'\n")
+    monkeypatch.syspath_prepend(str(script_dir))
+    monkeypatch.delitem(sys.modules, "hot_reload_collect_mod", raising=False)
+
+    files, refs = collect_config_source_components(
+        config={"general_settings": {"custom_auth": "hot_reload_collect_mod.user_api_key_auth"}},
+        config_file_path=str(main),
+    )
+    assert refs == ()
+    assert str(script) in files
+
+    # an edit to the importable module changes the fingerprint
+    before: str = compute_source_fingerprint(file_paths=files)
+    script.write_text("TOKEN = 'v2'\n")
+    after: str = compute_source_fingerprint(file_paths=files)
+    assert before != after
+    assert "hot_reload_collect_mod" not in sys.modules
+
+
+def test_collect_components_prefers_file_next_to_config(tmp_path, monkeypatch):
+    """When the script exists both next to the config and on sys.path, the
+    config-relative file wins (get_instance_fn resolution order)."""
+    main = tmp_path / "config.yaml"
+    main.write_text("")
+    local_script = tmp_path / "dual_auth_mod.py"
+    local_script.write_text("TOKEN = 'local'\n")
+    other_dir = tmp_path / "elsewhere"
+    other_dir.mkdir()
+    (other_dir / "dual_auth_mod.py").write_text("TOKEN = 'syspath'\n")
+    monkeypatch.syspath_prepend(str(other_dir))
+
+    files, _ = collect_config_source_components(
+        config={"general_settings": {"custom_auth": "dual_auth_mod.user_api_key_auth"}},
+        config_file_path=str(main),
+    )
+    assert files.count(str(local_script)) == 1
+    assert str(other_dir / "dual_auth_mod.py") not in files
+
+
+def test_collect_components_dedupes_shared_script_files(tmp_path, monkeypatch):
+    """Two settings pointing at the same importable module monitor its file
+    once."""
+    script_dir = tmp_path / "auth_src"
+    script_dir.mkdir()
+    script = script_dir / "hot_reload_shared_mod.py"
+    script.write_text("")
+    monkeypatch.syspath_prepend(str(script_dir))
+
+    main = tmp_path / "config.yaml"
+    main.write_text("")
+    files, _ = collect_config_source_components(
+        config={
+            "general_settings": {
+                "custom_auth": "hot_reload_shared_mod.user_api_key_auth",
+                "custom_key_generate": "hot_reload_shared_mod.key_generate",
+            }
+        },
+        config_file_path=str(main),
+    )
+    assert files.count(str(script)) == 1
 
 
 def test_collect_components_remote_mode_ignores_local_paths():

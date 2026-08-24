@@ -618,7 +618,10 @@ from litellm.proxy.spend_tracking.spend_management_endpoints import (
     router as spend_management_router,
 )
 from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
-from litellm.proxy.types_utils.utils import get_instance_fn
+from litellm.proxy.types_utils.utils import (
+    get_instance_fn,
+    reload_importable_script_module,
+)
 from litellm.proxy.ui_crud_endpoints.proxy_setting_endpoints import (
     router as ui_crud_endpoints_router,
 )
@@ -7336,6 +7339,10 @@ class ProxyConfig:
                         f"'{name}' must be a 'module.instance' string, "
                         f"got {type(raw_value).__name__}"
                     )
+                # importable-module refs resolve through the sys.modules cache;
+                # re-execute the module file so the edit that triggered this
+                # reload is actually visible to the freshly loaded handler
+                reload_importable_script_module(raw_value)
                 loaded_handler = get_instance_fn(value=raw_value, config_file_path=user_config_file_path)  # rebind-ok: per-iteration binding
                 new_value = cast("object", loaded_handler)  # cast-ok: untyped script loader, contract validated right after
                 self._validate_script_setting(name=name, value=new_value)

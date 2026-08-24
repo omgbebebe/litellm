@@ -17,7 +17,10 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Final, cast
 
-from litellm.proxy.types_utils.utils import resolve_local_script_path
+from litellm.proxy.types_utils.utils import (
+    get_importable_script_path,
+    resolve_local_script_path,
+)
 from litellm.types.llms.base import LiteLLMPydanticObjectBase
 
 # general_settings entries backed by a script (re-loaded on config change)
@@ -83,7 +86,9 @@ def _included_paths(config: Mapping[str, object], config_file_path: str) -> tupl
 
 def _script_refs(settings: Mapping[str, object], config_file_path: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """(local script paths, remote script refs) for the script-backed
-    general_settings entries."""
+    general_settings entries. A local path resolves either to the file
+    sitting next to the config file or to the file backing the importable
+    module, so edits to either are picked up by the fingerprint."""
     refs: Final = tuple(
         ref
         for name in SCRIPT_SETTING_NAMES
@@ -92,11 +97,13 @@ def _script_refs(settings: Mapping[str, object], config_file_path: str | None) -
     )
     remote: Final = tuple(ref for ref in refs if ref.startswith(("s3://", "gcs://")))
     local: Final = tuple(
-        path
-        for ref in refs
-        if not ref.startswith(("s3://", "gcs://"))
-        for path in (resolve_local_script_path(ref, config_file_path),)
-        if path is not None
+        dict.fromkeys(
+            path
+            for ref in refs
+            if not ref.startswith(("s3://", "gcs://"))
+            for path in (resolve_local_script_path(ref, config_file_path) or get_importable_script_path(ref),)
+            if path is not None
+        )
     )
     return local, remote
 
@@ -105,10 +112,12 @@ def collect_config_source_components(
     config: Mapping[str, object], config_file_path: str | None = None
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return (local file paths, remote references) that make up the config
-    source: the config file itself, its `include`d files, and the local
-    script files referenced by `general_settings`. With `config_file_path=None`
-    (remote s3/gcs config source) only remote references are collected. Raises
-    `FileNotFoundError` when an included file is missing."""
+    source: the config file itself, its `include`d files, and the files
+    backing the script-referencing `general_settings` entries — either the
+    local script next to the config file or the file of the importable module
+    the entry points at. With `config_file_path=None` (remote s3/gcs config
+    source) only remote references are collected. Raises `FileNotFoundError`
+    when an included file is missing."""
     own_path: Final = (
         (os.path.abspath(config_file_path),) if config_file_path is not None else ()
     )
