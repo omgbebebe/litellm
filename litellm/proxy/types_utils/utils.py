@@ -6,6 +6,20 @@ from collections.abc import Callable
 from typing import Any, Final, Literal, get_type_hints
 
 
+def resolve_local_script_path(value: str, config_file_path: str | None = None) -> str | None:
+    """
+    Resolve a ``module.instance`` reference to the local ``.py`` file sitting
+    next to the config file, or ``None`` when the reference is a remote URL,
+    plain import path, or no config file is in scope.
+    """
+    if config_file_path is None or value.startswith(("s3://", "gcs://")) or "." not in value:
+        return None
+    module_file_path: Final = os.path.join(
+        os.path.dirname(config_file_path), *value.split(".")[:-1]
+    ) + ".py"
+    return module_file_path if os.path.exists(module_file_path) else None
+
+
 def get_instance_fn(value: str, config_file_path: str | None = None) -> Any:
     module_name = value
     instance_name = None
@@ -35,10 +49,7 @@ def get_instance_fn(value: str, config_file_path: str | None = None) -> Any:
         module_name = ".".join(parts[:-1])
         instance_name = parts[-1]
 
-        module_file_path = None
-        if config_file_path is not None:
-            directory: Final = os.path.dirname(config_file_path)
-            module_file_path = os.path.join(directory, *module_name.split(".")) + ".py"
+        module_file_path: Final = resolve_local_script_path(value, config_file_path)
 
         if module_file_path is not None and os.path.exists(module_file_path):
             spec: Final = importlib.util.spec_from_file_location(module_name, module_file_path)

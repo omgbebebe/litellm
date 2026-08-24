@@ -3163,3 +3163,345 @@ async def test_ProxyConfig__init_guardrails_in_db_skips_only_the_unloadable_row(
 
     assert sorted(handler.IN_MEMORY_GUARDRAILS) == ["first", "last"]
     assert handler.reconciled_with == [{"first", "broken", "last"}]
+
+
+# ---------------------------------------------------------------------------
+# Config file hot reload (check_config_file_reload + helpers)
+# ---------------------------------------------------------------------------
+
+
+def _write_reload_fixture(tmp_path, script_body: str, config_body: str) -> tuple[str, str]:
+    script = tmp_path / "custom_auth.py"
+    script.write_text(script_body)
+    config = tmp_path / "config.yaml"
+    config.write_text(config_body)
+    return str(config), str(script)
+
+
+SCRIPT_CUSTOM_AUTH = """\
+from fastapi import Request, HTTPException
+from litellm.proxy._types import UserAPIKeyAuth
+
+STATIC_TOKENS = {
+    "sk-user-alice-key-123": {"user_id": "alice", "max_budget": 100.0},
+    "sk-user-bob-key-456": {"user_id": "bob", "max_budget": 100.0},
+}
+
+async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
+    if api_key in STATIC_TOKENS:
+        user_info = STATIC_TOKENS[api_key]
+        return UserAPIKeyAuth(
+            api_key=api_key,
+            user_id=user_info["user_id"],
+            max_budget=user_info["max_budget"],
+        )
+    raise HTTPException(status_code=401, detail="Invalid Static API Key")
+"""
+
+
+def _patch_reload_globals(monkeypatch, config_path: str, general_settings: dict | None = None):
+    import litellm.proxy.proxy_server as proxy_server_module
+
+    from litellm.caching.dual_cache import DualCache
+
+    monkeypatch.setattr(proxy_server_module, "user_config_file_path", config_path)
+    monkeypatch.setattr(proxy_server_module, "prisma_client", None)
+    monkeypatch.setattr(proxy_server_module, "store_model_in_db", False)
+    monkeypatch.setattr(proxy_server_module, "user_custom_auth", None)
+    monkeypatch.setattr(proxy_server_module, "master_key", None)
+    monkeypatch.setattr(proxy_server_module, "litellm_master_key_hash", None)
+    monkeypatch.setattr(proxy_server_module, "general_settings", general_settings or {})
+    monkeypatch.setattr(proxy_server_module, "user_api_key_cache", DualCache())
+    return proxy_server_module
+
+
+@pytest.mark.asyncio
+async def test_check_config_file_reload_applies_script_and_general_settings(tmp_path, monkeypatch):
+    """First tick applies the source; second identical tick is a no-op."""
+    config_path, script_path = _write_reload_fixture(
+        tmp_path,
+        SCRIPT_CUSTOM_AUTH,
+        "general_settings:\n"
+        "  custom_auth: custom_auth.user_api_key_auth\n"
+        "  master_key: mk1\n",
+    )
+    ps = _patch_reload_globals(monkeypatch, config_path)
+    pc = ProxyConfig()
+
+    outcome = await pc.check_config_file_reload()
+
+    assert outcome.fatal_error is None
+    assert outcome.section_errors == []
+    assert outcome.reloaded is True
+    assert outcome.applied_scripts == ["custom_auth"]
+    assert outcome.applied_general_settings == ["master_key"]
+    assert ps.user_custom_auth is not None
+    assert ps.master_key == "mk1"
+    assert ps.litellm_master_key_hash == ps.hash_token("mk1")
+    assert pc._config_file_fingerprint == outcome.fingerprint
+
+    again = await pc.check_config_file_reload()
+    assert again.reloaded is False
+    assert again.fingerprint == outcome.fingerprint
+    assert pc._config_file_fingerprint == outcome.fingerprint
+
+
+@pytest.mark.asyncio
+async def test_check_config_file_reload_hot_swaps_custom_auth_script(tmp_path, monkeypatch):
+    """Editing the script file (pointer unchanged) swaps in the new version at
+    the next tick: new tokens authenticate, old ones are rejected."""
+    config_path, script_path = _write_reload_fixture(
+        tmp_path,
+        SCRIPT_CUSTOM_AUTH,
+        "general_settings:\n  custom_auth: custom_auth.user_api_key_auth\n",
+    )
+    ps = _patch_reload_globals(monkeypatch, config_path)
+    pc = ProxyConfig()
+    baseline = await pc.check_config_file_reload()
+    assert baseline.fatal_error is None
+
+    async def invoke(api_key: str):
+        from fastapi import HTTPException
+
+        try:
+            result = await ps.user_custom_auth(request=object(), api_key=api_key)
+        except HTTPException as e:
+            return e.status_code
+        return getattr(result, "user_id", None)
+
+    assert await invoke("sk-user-bob-key-456") == "bob"
+    assert await invoke("sk-user-unknown") == 401
+
+    with open(script_path, "w") as f:
+        f.write(
+            SCRIPT_CUSTOM_AUTH
+            .replace("sk-user-alice-key-123", "sk-user-carol-key-789")
+            .replace('"user_id": "alice"', '"user_id": "carol"')
+            .replace("sk-user-bob-key-456", "REMOVED")
+        )
+
+    outcome = await pc.check_config_file_reload()
+
+    assert outcome.fatal_error is None
+    assert outcome.section_errors == []
+    assert outcome.reloaded is True
+    assert outcome.applied_scripts == ["custom_auth"]
+    assert await invoke("sk-user-carol-key-789") == "carol"
+    assert await invoke("sk-user-bob-key-456") == 401
+
+
+@pytest.mark.asyncio
+async def test_check_config_file_reload_keeps_old_script_on_syntax_error(tmp_path, monkeypatch):
+    """A broken script must not replace a working one (fail-closed), and the
+    next tick retries once the file is fixed."""
+    config_path, script_path = _write_reload_fixture(
+        tmp_path,
+        SCRIPT_CUSTOM_AUTH,
+        "general_settings:\n  custom_auth: custom_auth.user_api_key_auth\n",
+    )
+    ps = _patch_reload_globals(monkeypatch, config_path)
+    pc = ProxyConfig()
+    baseline = await pc.check_config_file_reload()
+    assert baseline.fatal_error is None
+    working_script = ps.user_custom_auth
+
+    with open(script_path, "w") as f:
+        f.write("def broken(:\n")
+    broken_outcome = await pc.check_config_file_reload()
+
+    assert broken_outcome.reloaded is False
+    assert broken_outcome.fatal_error is None
+    assert broken_outcome.section_errors
+    assert "custom_auth" in broken_outcome.section_errors[0]
+    assert ps.user_custom_auth is working_script
+    assert pc._config_file_fingerprint == baseline.fingerprint
+
+    with open(script_path, "w") as f:
+        f.write(SCRIPT_CUSTOM_AUTH.replace("bob", "carol").replace("sk-user-bob-key-456", "sk-user-carol-key-789"))
+
+    fixed_outcome = await pc.check_config_file_reload()
+    assert fixed_outcome.fatal_error is None
+    assert fixed_outcome.section_errors == []
+    assert fixed_outcome.reloaded is True
+    assert ps.user_custom_auth is not working_script
+
+
+@pytest.mark.asyncio
+async def test_check_config_file_reload_keeps_old_script_on_bad_contract(tmp_path, monkeypatch):
+    """A script whose handler does not match the (request, api_key) contract is
+    rejected before it replaces the working one."""
+    config_path, script_path = _write_reload_fixture(
+        tmp_path,
+        SCRIPT_CUSTOM_AUTH,
+        "general_settings:\n  custom_auth: custom_auth.user_api_key_auth\n",
+    )
+    ps = _patch_reload_globals(monkeypatch, config_path)
+    pc = ProxyConfig()
+    baseline = await pc.check_config_file_reload()
+    assert baseline.fatal_error is None
+    working_script = ps.user_custom_auth
+
+    with open(script_path, "w") as f:
+        f.write("async def user_api_key_auth(token):\n    return None\n")
+    outcome = await pc.check_config_file_reload()
+
+    assert outcome.reloaded is False
+    assert outcome.section_errors
+    assert "request" in outcome.section_errors[0]
+    assert ps.user_custom_auth is working_script
+
+
+@pytest.mark.asyncio
+async def test_check_config_file_reload_explicit_null_clears_custom_auth(tmp_path, monkeypatch):
+    """`custom_auth: null` in the YAML removes the custom auth function."""
+    config_path, _script_path = _write_reload_fixture(
+        tmp_path,
+        SCRIPT_CUSTOM_AUTH,
+        "general_settings:\n  custom_auth: custom_auth.user_api_key_auth\n",
+    )
+    ps = _patch_reload_globals(monkeypatch, config_path)
+    pc = ProxyConfig()
+    baseline = await pc.check_config_file_reload()
+    assert baseline.fatal_error is None
+    assert ps.user_custom_auth is not None
+
+    with open(config_path, "w") as f:
+        f.write("general_settings:\n  custom_auth: null\n")
+    outcome = await pc.check_config_file_reload()
+
+    assert outcome.fatal_error is None
+    assert outcome.section_errors == []
+    assert outcome.cleared_scripts == ["custom_auth"]
+    assert ps.user_custom_auth is None
+
+
+@pytest.mark.asyncio
+async def test_check_config_file_reload_invalid_yaml_keeps_applied_state(tmp_path, monkeypatch):
+    """Unparseable YAML fails closed: state and fingerprint are untouched so
+    the next tick retries."""
+    config_path, _script_path = _write_reload_fixture(
+        tmp_path,
+        SCRIPT_CUSTOM_AUTH,
+        "general_settings:\n  custom_auth: custom_auth.user_api_key_auth\n",
+    )
+    ps = _patch_reload_globals(monkeypatch, config_path)
+    pc = ProxyConfig()
+    baseline = await pc.check_config_file_reload()
+    assert baseline.fatal_error is None
+    working_script = ps.user_custom_auth
+
+    with open(config_path, "w") as f:
+        f.write("general_settings:\n  custom_auth: [unclosed\n")
+    outcome = await pc.check_config_file_reload()
+
+    assert outcome.reloaded is False
+    assert outcome.fatal_error == "config source unreadable"
+    assert ps.user_custom_auth is working_script
+    assert pc._config_file_fingerprint == baseline.fingerprint
+
+
+@pytest.mark.asyncio
+async def test_check_config_file_reload_schema_validation_failure_keeps_state(tmp_path, monkeypatch):
+    """Valid YAML that fails ConfigYAML validation is rejected before any
+    section is applied."""
+    config_path, _script_path = _write_reload_fixture(
+        tmp_path,
+        SCRIPT_CUSTOM_AUTH,
+        "general_settings:\n  master_key: mk1\n",
+    )
+    ps = _patch_reload_globals(monkeypatch, config_path)
+    pc = ProxyConfig()
+    baseline = await pc.check_config_file_reload()
+    assert baseline.fatal_error is None
+    assert ps.master_key == "mk1"
+
+    with open(config_path, "w") as f:
+        f.write('general_settings:\n  master_key: ["mk2", "mk3"]\n')
+    outcome = await pc.check_config_file_reload()
+
+    assert outcome.reloaded is False
+    assert outcome.fatal_error is not None
+    assert "validation" in outcome.fatal_error
+    assert ps.master_key == "mk1"
+    assert pc._config_file_fingerprint == baseline.fingerprint
+
+
+@pytest.mark.asyncio
+async def test_check_config_file_reload_master_key_swap_purges_cached_identity(tmp_path, monkeypatch):
+    """A master_key change swaps the key+hash and evicts the old key's cached
+    identity so the old key stops authenticating immediately."""
+    config_path, _script_path = _write_reload_fixture(
+        tmp_path,
+        SCRIPT_CUSTOM_AUTH,
+        "general_settings:\n  master_key: mk1\n",
+    )
+    ps = _patch_reload_globals(monkeypatch, config_path)
+    pc = ProxyConfig()
+    baseline = await pc.check_config_file_reload()
+    assert baseline.fatal_error is None
+
+    await ps.user_api_key_cache.async_set_cache(key=ps.hash_token("mk1"), value={"cached": True})
+    assert await ps.user_api_key_cache.async_get_cache(key=ps.hash_token("mk1")) is not None
+
+    with open(config_path, "w") as f:
+        f.write("general_settings:\n  master_key: mk2\n")
+    outcome = await pc.check_config_file_reload()
+
+    assert outcome.fatal_error is None
+    assert outcome.applied_general_settings == ["master_key"]
+    assert ps.master_key == "mk2"
+    assert ps.litellm_master_key_hash == ps.hash_token("mk2")
+    assert await ps.user_api_key_cache.async_get_cache(key=ps.hash_token("mk1")) is None
+    assert ps.general_settings.get("master_key") == "mk2"
+
+
+@pytest.mark.asyncio
+async def test_check_config_file_reload_general_settings_hot_and_restart_split(tmp_path, monkeypatch):
+    """Hot-safe keys are applied; restart-required and unsupported keys are
+    only reported, never applied."""
+    config_path, _script_path = _write_reload_fixture(
+        tmp_path,
+        SCRIPT_CUSTOM_AUTH,
+        "general_settings:\n"
+        "  max_parallel_requests: 1\n"
+        "  database_url: postgres://old\n"
+        "  proxy_config_reload_interval_seconds: 55\n",
+    )
+    ps = _patch_reload_globals(
+        monkeypatch,
+        config_path,
+        general_settings={
+            "max_parallel_requests": 1,
+            "database_url": "postgres://old",
+            "proxy_config_reload_interval_seconds": 55,
+        },
+    )
+    pc = ProxyConfig()
+    baseline = await pc.check_config_file_reload()
+    assert baseline.fatal_error is None
+
+    with open(config_path, "w") as f:
+        f.write(
+            "general_settings:\n"
+            "  max_parallel_requests: 7\n"
+            "  user_api_key_cache_ttl: 120\n"
+            "  database_url: postgres://new\n"
+            "  proxy_config_reload_interval_seconds: 99\n"
+            "  definitely_unknown_key: true\n"
+        )
+    outcome = await pc.check_config_file_reload()
+
+    assert outcome.fatal_error is None
+    assert sorted(outcome.applied_general_settings) == [
+        "max_parallel_requests",
+        "user_api_key_cache_ttl",
+    ]
+    assert ps.general_settings.get("max_parallel_requests") == 7
+    assert ps.general_settings.get("user_api_key_cache_ttl") == 120
+    assert ps.user_api_key_cache.default_in_memory_ttl == 120.0
+    assert ps.general_settings.get("database_url") == "postgres://old"
+    assert set(outcome.restart_required) == {
+        "database_url",
+        "proxy_config_reload_interval_seconds",
+        "definitely_unknown_key",
+    }

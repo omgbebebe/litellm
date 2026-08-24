@@ -16,7 +16,16 @@ import threading
 import time
 import traceback
 import warnings
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, MutableMapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Mapping,
+    MutableMapping,
+    Sequence,
+)
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType, UnionType
 from typing import (
@@ -321,6 +330,16 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import (
     AuthCacheInvalidationSubscriber,
 )
 from litellm.proxy.common_utils.callback_utils import initialize_callbacks_on_proxy
+from litellm.proxy.common_utils.config_file_reload import (
+    SCRIPT_SETTING_NAMES,
+    ConfigFileReloadOutcome,
+    collect_config_source_components,
+    compute_parsed_config_fingerprint,
+    compute_source_fingerprint,
+    validate_custom_auth_callable,
+    validate_custom_key_generate_callable,
+    validate_custom_key_update_callable,
+)
 from litellm.proxy.common_utils.config_sync_pubsub import ConfigSyncSubscriber
 from litellm.proxy.common_utils.debug_utils import init_verbose_loggers
 from litellm.proxy.common_utils.debug_utils import router as debugging_endpoints_router
@@ -527,6 +546,7 @@ from litellm.proxy.management_helpers.audit_logs import (
 from litellm.proxy.management_helpers.team_metadata_validation import (
     TEAM_METADATA_SCHEMA_REGISTRY,
     TEAM_METADATA_VALIDATOR_REGISTRY,
+    TeamMetadataValidator,
     parse_team_metadata_schema,
 )
 from litellm.proxy.memory.memory_endpoints import router as memory_router
@@ -2245,7 +2265,7 @@ redis_usage_cache: RedisCache | None = None  # redis cache used for tracking spe
 polling_via_cache_enabled: Literal["all"] | list[str] | bool = False
 native_background_mode: list[str] = []  # Models that should use native provider background mode instead of polling
 polling_cache_ttl: int = 3600  # Default 1 hour TTL for polling cache
-user_custom_auth = None
+user_custom_auth: Callable[..., Awaitable[UserAPIKeyAuth]] | None = None
 user_custom_key_generate = None
 # Sentinel: prevents PKCE-no-Redis advisory from re-logging on config hot-reload.
 # Tests that need to reset it can patch 'litellm.proxy.proxy_server._pkce_no_redis_warning_emitted'.
@@ -4192,6 +4212,80 @@ def should_load_db_object(object_type: str | SupportedDBObjectType) -> bool:
     return any(str(obj) == object_type_str for obj in supported_db_objects)
 
 
+@dataclass(frozen=True)
+class _GeneralSettingsReloadReport:
+    """Result of re-applying hot-safe general_settings entries."""
+
+    applied: tuple[str, ...]
+    restart_required: Mapping[str, str]
+    errors: tuple[str, ...]
+
+
+# general_settings keys a config-file reload may re-apply at runtime
+# (read live on the request path, no one-shot init state behind them)
+_CONFIG_RELOAD_HOT_GENERAL_SETTINGS: Final[frozenset[str]] = frozenset(
+    {
+        "master_key",
+        "custom_auth_run_common_checks",
+        "user_api_key_cache_ttl",
+        "ui_access_mode",
+        "store_model_in_db",
+        "disable_spend_logs",
+        "max_parallel_requests",
+        "global_max_parallel_requests",
+        "max_batch_file_size_mb",
+        "max_request_size_mb",
+        "max_response_size_mb",
+        "always_include_stream_usage",
+        "forward_client_headers_to_llm_api",
+        "mcp_internal_ip_ranges",
+        "mcp_trusted_proxy_ranges",
+        "mcp_xff_num_trusted_hops",
+        "mcp_required_fields",
+        "cancel_on_disconnect",
+        "apply_user_budget_to_team_keys",
+        "disable_auto_add_proxy_admin_to_teams",
+        "store_prompts_in_spend_logs",
+        "litellm_key_header_name",
+        "use_legacy_interactions_schema",
+        "role_permissions",
+        "team_metadata_schema",
+        "alerting_args",
+    }
+)
+
+# general_settings keys that build one-shot state (connections, handlers,
+# schedulers, license gates) and require a restart to change
+_CONFIG_RELOAD_RESTART_REQUIRED_GENERAL_SETTINGS: Final[frozenset[str]] = frozenset(
+    {
+        "database_url",
+        "pass_through_endpoints",
+        "background_health_checks",
+        "use_shared_health_check",
+        "health_check_interval",
+        "health_check_concurrency",
+        "health_check_details",
+        "enable_health_check_routing",
+        "health_check_staleness_threshold",
+        "health_check_ignore_transient_errors",
+        "key_management_settings",
+        "use_google_kms",
+        "use_azure_key_vault",
+        "enable_jwt_auth",
+        "enable_oauth2_auth",
+        "enable_oauth2_proxy_auth",
+        "proxy_config_reload_interval_seconds",
+        "proxy_batch_write_at",
+        "proxy_batch_polling_interval",
+        "proxy_budget_rescheduler_min_time",
+        "proxy_budget_rescheduler_max_time",
+        "litellm_license",
+        "enforced_params",
+        "allowed_ips",
+    }
+)
+
+
 class ProxyConfig:
     """
     Abstraction class on top of config loading/updating logic. Gives us one place to control all config updating logic.
@@ -4218,6 +4312,10 @@ class ProxyConfig:
         # during periodic config reloads (_update_general_settings).
         self._yaml_general_settings_keys: set[str] = set()  # mutable-ok: populated once at startup, read-only thereafter  # fmt: skip
         self._yaml_spend_log_cleanup_bounds: dict[str, object] = {}  # mutable-ok: snapshot of YAML bounds at load time  # fmt: skip
+        # Fingerprint of the last applied config source (raw YAML + local
+        # script files). None until load_config runs; a tick that cannot
+        # compute a fingerprint keeps this unchanged (fail-closed).
+        self._config_file_fingerprint: str | None = None
 
     def is_yaml(self, config_file_path: str) -> bool:
         if not os.path.isfile(config_file_path):
@@ -5562,6 +5660,12 @@ class ProxyConfig:
 
         ## NON-LLM CONFIGS eg. MCP tools, vector stores, etc.
         await self._init_non_llm_configs(config=config, config_file_path=config_file_path)
+
+        # Baseline for the config-file reload poller: the first tick must
+        # observe "unchanged" for the config this startup just applied
+        self._config_file_fingerprint = await self._compute_config_source_fingerprint(
+            file_path=config_file_path
+        )
 
         return router, router.get_model_list(), general_settings
 
@@ -7080,6 +7184,321 @@ class ProxyConfig:
 
         except Exception as e:
             verbose_proxy_logger.exception("Error in _check_and_reload_model_cost_map: %s", e)
+
+    async def check_config_file_reload(self) -> ConfigFileReloadOutcome:
+        """
+        Poll the config source and re-apply the hot-safe sections when it
+        changed. Fail-closed: an unreadable source, a load/validation
+        failure, or any section error keeps the previously applied state and
+        the old fingerprint, so the next tick retries once the source is
+        fixed.
+        """
+        file_path: Final = user_config_file_path
+        if file_path is None and os.environ.get("LITELLM_CONFIG_BUCKET_NAME") is None:
+            return ConfigFileReloadOutcome()
+
+        fingerprint: Final = await self._compute_config_source_fingerprint(file_path=file_path)
+        if fingerprint is None:
+            verbose_proxy_logger.warning(
+                "Config file reload: config source unreadable this tick; keeping applied state"
+            )
+            return ConfigFileReloadOutcome(fatal_error="config source unreadable")
+        if self._config_file_fingerprint is not None and fingerprint == self._config_file_fingerprint:
+            return ConfigFileReloadOutcome(fingerprint=fingerprint)
+
+        try:
+            new_config: Final[Mapping[str, object]] = await self.get_config(
+                config_file_path=file_path
+            )
+        except Exception as e:
+            verbose_proxy_logger.error(
+                "Config file reload: failed to load new config, keeping applied state: %s", str(e)
+            )
+            return ConfigFileReloadOutcome(
+                fingerprint=fingerprint, fatal_error=f"failed to load new config: {e}"
+            )
+
+        outcome: Final = await self._apply_config_file_reload(new_config=new_config)
+        outcome.fingerprint = fingerprint
+        if outcome.fatal_error is None and not outcome.section_errors:
+            self._config_file_fingerprint = fingerprint
+            verbose_proxy_logger.info(
+                "Config file reload applied: scripts=%s, general_settings=%s, restart_required=%s",
+                outcome.applied_scripts,
+                outcome.applied_general_settings,
+                sorted(outcome.restart_required),
+            )
+        elif outcome.fatal_error is None:
+            verbose_proxy_logger.warning(
+                "Config file reload partially failed (keeping previous state for failed sections): %s",
+                outcome.section_errors,
+            )
+        return outcome
+
+    async def _compute_config_source_fingerprint(self, file_path: str | None) -> str | None:
+        """sha256 of the raw config source: the YAML file itself plus its
+        `include`d files and the local script files referenced by
+        `general_settings` — or the parsed remote object for s3/gcs config
+        sources. Returns None when the source cannot be read (fail-closed)."""
+        bucket_name: Final = os.environ.get("LITELLM_CONFIG_BUCKET_NAME", None)
+        try:
+            if bucket_name is not None:
+                object_key: Final = os.environ.get("LITELLM_CONFIG_BUCKET_OBJECT_KEY", "")
+                if os.environ.get("LITELLM_CONFIG_BUCKET_TYPE", "") == "gcs":
+                    raw_remote_config = await get_config_file_contents_from_gcs(  # rebind-ok: one branch per bucket type; a Final double-assignment is rejected
+                        bucket_name=bucket_name, object_key=object_key
+                    )
+                else:
+                    raw_remote_config = get_file_contents_from_s3(  # rebind-ok: one branch per bucket type; a Final double-assignment is rejected
+                        bucket_name=bucket_name, object_key=object_key
+                    )
+                remote_config: Final = cast("Mapping[str, object] | None", raw_remote_config)  # cast-ok: untyped bucket loaders return the parsed yaml mapping
+                if remote_config is None:
+                    return None
+                _remote_files, remote_script_refs = collect_config_source_components(
+                    config=remote_config, config_file_path=None
+                )
+                return compute_source_fingerprint(
+                    remote_refs=(
+                        compute_parsed_config_fingerprint(remote_config),
+                        *remote_script_refs,
+                    )
+                )
+            if file_path is None or not os.path.isfile(file_path):
+                return None
+            with open(file_path, "r", encoding="utf-8") as f:
+                parsed_raw: Final = cast("object", yaml.safe_load(f.read()))  # cast-ok: untyped yaml.safe_load returns the parsed yaml mapping
+            if not isinstance(parsed_raw, dict):
+                return None
+            parsed: Final = cast("Mapping[str, object]", parsed_raw)  # cast-ok: narrowed to a mapping above
+            file_paths, file_remote_refs = collect_config_source_components(
+                config=parsed, config_file_path=file_path
+            )
+            return compute_source_fingerprint(file_paths=file_paths, remote_refs=file_remote_refs)
+        except Exception as e:
+            verbose_proxy_logger.warning(
+                "Config file reload: could not fingerprint config source: %s", str(e)
+            )
+            return None
+
+    async def _apply_config_file_reload(
+        self, new_config: Mapping[str, object]
+    ) -> ConfigFileReloadOutcome:
+        """Validate the freshly loaded config and re-apply the hot-safe
+        sections. A validation failure is fatal (nothing is applied); a
+        per-section failure only affects that section (fail-closed)."""
+        try:
+            ConfigYAML(**new_config)
+        except Exception as e:
+            return ConfigFileReloadOutcome(fatal_error=f"config validation failed: {e}")
+
+        outcome: Final = ConfigFileReloadOutcome(reloaded=False)
+        applied_scripts, cleared_scripts, script_errors = self._apply_script_settings_reload(
+            new_config=new_config
+        )
+        outcome.applied_scripts = list(applied_scripts)  # mutable-ok: outcome field is a pydantic list; model field assignment skips validation
+        outcome.cleared_scripts = list(cleared_scripts)  # mutable-ok: outcome field is a pydantic list; model field assignment skips validation
+        outcome.section_errors = list(script_errors)  # mutable-ok: outcome field is a pydantic list; model field assignment skips validation
+        general_settings_report: Final = await self._apply_general_settings_reload(new_config)
+        outcome.applied_general_settings = list(general_settings_report.applied)  # mutable-ok: outcome field is a pydantic list; model field assignment skips validation
+        outcome.restart_required = dict(general_settings_report.restart_required)  # mutable-ok: outcome field is a pydantic dict; model field assignment skips validation
+        outcome.section_errors.extend(general_settings_report.errors)
+        outcome.reloaded = bool(
+            outcome.applied_scripts or outcome.cleared_scripts or outcome.applied_general_settings
+        )
+        return outcome
+
+    def _apply_script_settings_reload(
+        self, new_config: Mapping[str, object]
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        """Re-load the script-backed general_settings entries pointed at by
+        the new config. Each setting fails closed: on load or contract
+        validation failure the previously loaded script stays in place.
+        Returns (applied, cleared, errors)."""
+        gs_raw: Final = new_config.get("general_settings")
+        if not isinstance(gs_raw, Mapping):
+            return (), (), ()
+        general_settings: Final = cast("Mapping[str, object]", gs_raw)  # cast-ok: narrowed to a mapping above
+        applied: Final[list[str]] = []  # mutable-ok: per-setting results accumulated across the settings loop
+        cleared: Final[list[str]] = []  # mutable-ok: per-setting results accumulated across the settings loop
+        errors: Final[list[str]] = []  # mutable-ok: per-setting results accumulated across the settings loop
+        for name in SCRIPT_SETTING_NAMES:
+            if name not in general_settings:
+                continue
+            raw_value = general_settings[name]  # rebind-ok: per-iteration binding
+            try:
+                if raw_value is None:
+                    self._clear_script_setting(name=name)
+                    cleared.append(name)
+                    continue
+                if not isinstance(raw_value, str):
+                    raise ValueError(
+                        f"'{name}' must be a 'module.instance' string, "
+                        f"got {type(raw_value).__name__}"
+                    )
+                loaded_handler = get_instance_fn(value=raw_value, config_file_path=user_config_file_path)  # rebind-ok: per-iteration binding
+                new_value = cast("object", loaded_handler)  # cast-ok: untyped script loader, contract validated right after
+                self._validate_script_setting(name=name, value=new_value)
+                self._swap_script_setting(name=name, value=new_value)
+                applied.append(name)
+            except Exception as e:
+                errors.append(f"'{name}': keeping current script (reload failed: {e})")
+        return tuple(applied), tuple(cleared), tuple(errors)
+
+    @staticmethod
+    def _validate_script_setting(name: str, value: object) -> None:
+        match name:
+            case "custom_auth":
+                validate_custom_auth_callable(value)
+            case "custom_key_generate":
+                validate_custom_key_generate_callable(value)
+            case "custom_key_update":
+                validate_custom_key_update_callable(value)
+            case _:  # sso / ui-sso / registry settings have no signature contract
+                pass
+
+    def _swap_script_setting(self, name: str, value: object) -> None:
+        match name:
+            case "custom_auth":
+                global user_custom_auth
+                swapped_auth: Final = cast("Callable[..., Awaitable[UserAPIKeyAuth]] | None", value)  # cast-ok: handler contract validated by _validate_script_setting before the swap
+                user_custom_auth = swapped_auth  # rebind-ok: hot-swap of the request-time auth handler
+            case "custom_key_generate":
+                global user_custom_key_generate
+                user_custom_key_generate = value  # rebind-ok: hot-swap of the request-time handler
+            case "custom_key_update":
+                global user_custom_key_update
+                user_custom_key_update = value  # rebind-ok: hot-swap of the request-time handler
+            case "custom_sso":
+                global user_custom_sso
+                user_custom_sso = value  # rebind-ok: hot-swap of the request-time handler
+            case "custom_ui_sso_sign_in_handler":
+                global user_custom_ui_sso_sign_in_handler
+                user_custom_ui_sso_sign_in_handler = value  # rebind-ok: hot-swap of the request-time handler
+            case "custom_team_metadata_validate":
+                TEAM_METADATA_VALIDATOR_REGISTRY.set(
+                    cast("TeamMetadataValidator | None", value)  # cast-ok: registry enforces the validator contract at request time
+                )
+            case _:
+                pass
+
+    def _clear_script_setting(self, name: str) -> None:
+        match name:
+            case "custom_auth":
+                global user_custom_auth
+                user_custom_auth = None  # rebind-ok: explicit removal of the request-time auth handler
+            case "custom_key_generate":
+                global user_custom_key_generate
+                user_custom_key_generate = None  # rebind-ok: explicit removal of the request-time handler
+            case "custom_key_update":
+                global user_custom_key_update
+                user_custom_key_update = None  # rebind-ok: explicit removal of the request-time handler
+            case "custom_sso":
+                global user_custom_sso
+                user_custom_sso = None  # rebind-ok: explicit removal of the request-time handler
+            case "custom_ui_sso_sign_in_handler":
+                global user_custom_ui_sso_sign_in_handler
+                user_custom_ui_sso_sign_in_handler = None  # rebind-ok: explicit removal of the request-time handler
+            case "custom_team_metadata_validate":
+                TEAM_METADATA_VALIDATOR_REGISTRY.set(None)
+            case _:
+                pass
+
+    async def _apply_general_settings_reload(
+        self, new_config: Mapping[str, object]
+    ) -> _GeneralSettingsReloadReport:
+        """Re-apply the hot-safe `general_settings` entries from the new
+        config. Restart-required keys are reported, never applied."""
+        global store_model_in_db, disable_spend_logs
+        applied: Final[list[str]] = []  # mutable-ok: per-key results accumulated across the hot-apply loop
+        restart_required: Final[dict[str, str]] = {}  # mutable-ok: per-key results accumulated across the hot-apply loop
+        errors: Final[list[str]] = []  # mutable-ok: per-key results accumulated across the hot-apply loop
+        gs_raw: Final = new_config.get("general_settings")
+        if not isinstance(gs_raw, Mapping):
+            return _GeneralSettingsReloadReport(
+                applied=tuple(applied), restart_required=restart_required, errors=tuple(errors)
+            )
+        new_general_settings: Final = cast("Mapping[str, object]", gs_raw)  # cast-ok: yaml general_settings is a flat mapping
+        for key, new_value in new_general_settings.items():
+            if key in SCRIPT_SETTING_NAMES:
+                continue
+            if general_settings.get(key) == new_value:
+                continue
+            if key in _CONFIG_RELOAD_RESTART_REQUIRED_GENERAL_SETTINGS:
+                restart_required[key] = "takes effect after restart"
+                continue
+            if key not in _CONFIG_RELOAD_HOT_GENERAL_SETTINGS:
+                restart_required[key] = "no hot-reload support; takes effect after restart"
+                continue
+            try:
+                match key:
+                    case "master_key":
+                        await self._apply_master_key_change(new_value=new_value)
+                    case "user_api_key_cache_ttl":
+                        general_settings["user_api_key_cache_ttl"] = new_value
+                        ttl = (  # rebind-ok: per-iteration binding
+                            float(new_value) if isinstance(new_value, (int, float)) else float(str(new_value))
+                        )
+                        user_api_key_cache.update_cache_ttl(
+                            default_in_memory_ttl=ttl, default_redis_ttl=ttl
+                        )
+                    case "store_model_in_db":
+                        general_settings["store_model_in_db"] = new_value
+                        store_model_in_db = new_value  # rebind-ok: standalone global mirrors the hot-reloaded general_settings entry
+                    case "disable_spend_logs":
+                        general_settings["disable_spend_logs"] = new_value
+                        disable_spend_logs = new_value  # rebind-ok: standalone global mirrors the hot-reloaded general_settings entry
+                    case "use_legacy_interactions_schema":
+                        general_settings["use_legacy_interactions_schema"] = new_value
+                        litellm.use_legacy_interactions_schema = new_value
+                    case "role_permissions":
+                        rbac_role_permissions = new_value  # rebind-ok: per-iteration binding
+                        if not isinstance(rbac_role_permissions, list):
+                            raise ValueError("role_permissions must be a list")
+                        general_settings["role_permissions"] = [  # mutable-ok: RBAC request path expects list[RoleBasedPermissions]
+                            RoleBasedPermissions.model_validate(
+                                cast("dict[str, object]", role_permission)  # cast-ok: yaml role-permission entries are scalar dicts
+                            )
+                            for role_permission in rbac_role_permissions
+                        ]
+                    case "team_metadata_schema":
+                        general_settings["team_metadata_schema"] = new_value
+                        TEAM_METADATA_SCHEMA_REGISTRY.set(
+                            parse_team_metadata_schema(new_value)
+                        )
+                    case "alerting_args":
+                        general_settings["alerting_args"] = new_value
+                        proxy_logging_obj.slack_alerting_instance.update_values(
+                            alerting_args=cast("Mapping[str, object]", new_value)  # cast-ok: yaml alerting_args is a flat mapping
+                        )
+                    case _:
+                        general_settings[key] = new_value
+            except Exception as e:
+                errors.append(f"'{key}': keeping current value (reload failed: {e})")
+                continue
+            applied.append(key)
+        return _GeneralSettingsReloadReport(
+            applied=tuple(applied), restart_required=restart_required, errors=tuple(errors)
+        )
+
+    async def _apply_master_key_change(self, new_value: object) -> None:
+        """Swap `master_key`/`litellm_master_key_hash` and evict the old
+        key's cached identity so it stops authenticating immediately."""
+        global master_key, litellm_master_key_hash
+        old_master_key: Final = master_key
+        if isinstance(new_value, str):
+            master_key = new_value  # rebind-ok: hot-rotated from the reloaded config file
+            litellm_master_key_hash = hash_token(master_key)  # rebind-ok: hot-rotated from the reloaded config file
+        else:
+            master_key = None  # rebind-ok: master key removed from the reloaded config file
+            litellm_master_key_hash = None  # rebind-ok: master key removed from the reloaded config file
+        general_settings["master_key"] = master_key
+        if (
+            isinstance(old_master_key, str)
+            and master_key is not None
+            and old_master_key != master_key
+        ):
+            await user_api_key_cache.async_delete_cache(hash_token(old_master_key))
 
     async def _check_and_reload_anthropic_beta_headers(self, prisma_client: PrismaClient):
         """
@@ -9024,6 +9443,16 @@ class ProxyStartupEvent:
             seconds=config_reload_interval_seconds,
             args=[prisma_client],
             id="periodic_reload_job",
+            replace_existing=True,
+            misfire_grace_time=APSCHEDULER_MISFIRE_GRACE_TIME,
+        )
+
+        ### CONFIG FILE HOT RELOAD (YAML + script source, per-worker poll) ###
+        scheduler.add_job(
+            proxy_config.check_config_file_reload,
+            "interval",
+            seconds=config_reload_interval_seconds,
+            id="config_file_reload_job",
             replace_existing=True,
             misfire_grace_time=APSCHEDULER_MISFIRE_GRACE_TIME,
         )
@@ -16905,6 +17334,37 @@ async def reload_model_cost_map(
     except Exception as e:
         verbose_proxy_logger.exception("Failed to reload model cost map: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to reload model cost map: {e}")
+
+
+@router.post(
+    "/reload/config_file",
+    tags=["config.yaml"],  # mutable-ok: FastAPI route metadata
+    dependencies=[Depends(user_api_key_auth)],  # mutable-ok: FastAPI route metadata
+    include_in_schema=False,
+)
+async def reload_config_file(
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    """
+    ADMIN ONLY ENDPOINT
+
+    Run one config-file reload check now in this worker: re-read the YAML
+    config source, validate it, and re-apply the hot-safe sections (script
+    handlers such as `custom_auth`, and the hot-safe `general_settings`
+    entries). Returns the reload report; fail-closed on error.
+    """
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied. Admin role required. Current role: {user_api_key_dict.user_role}",
+        )
+
+    try:
+        outcome: Final = await proxy_config.check_config_file_reload()
+    except Exception as e:
+        verbose_proxy_logger.exception("Failed to reload config file: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to reload config file: {e}")
+    return outcome.model_dump()
 
 
 @router.post(
