@@ -14,7 +14,7 @@
       # uv.lock/pyproject changes), set `nixpkgs.lib.fakeHash` for it, run
       # `nix build .#wheels`, and record the "got: sha256-..." from the error.
       venvHashes = {
-        x86_64-linux = "sha256-N7BY+iixKWsHxjb+8wHr7yFH/LBHldnV7xZqlw5KWA8=";
+        x86_64-linux = "sha256-hp354aH8ywNvv06v2eLr6G3xEvdFWaGc6YmGDPIt5xE=";
       };
       # Prisma derives the platform from /etc/os-release ("linux-nixos"), for which
       # binaries.prisma.sh publishes no engines (404). Pin the glibc build for the
@@ -60,7 +60,12 @@
       # 1. litellmWheels (fixed-output derivation — FODs are the only builds
       #    allowed network): `uv export` the pinned requirements and download
       #    every wheel. Only downloads: a FOD's output must not reference
-      #    store paths, so the venv itself cannot be built here.
+      #    store paths, so the venv itself cannot be built here. Extras
+      #    proxy + proxy-runtime (the Docker image's runtime dependency
+      #    set: opentelemetry, langfuse, prometheus-client, sentry, ...).
+      #    extra_proxy/semantic-router/saml from the Dockerfile are skipped:
+      #    prisma's engine download does not work in a sandbox, and the
+      #    other two are niche.
       # 2. litellmVenv (normal derivation): create a venv on nix python312 and
       #    `uv pip install` strictly from the wheelhouse. The litellm package
       #    itself is copied in by hand: installing the root via uv would run
@@ -97,6 +102,7 @@
               --frozen \
               --no-dev \
               --extra proxy \
+              --extra proxy-runtime \
               --no-emit-workspace \
               --no-hashes \
               -o - | grep -v '^#' > $out/requirements.txt

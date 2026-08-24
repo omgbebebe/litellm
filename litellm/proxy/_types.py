@@ -2471,7 +2471,7 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
     proxy_config_reload_interval_seconds: int = Field(
         30,
         gt=0,
-        description="how often (in seconds) each pod reloads config-in-DB objects (models, credentials, guardrails, etc.) when store_model_in_db is enabled; lower values speed up multi-pod convergence at the cost of more DB load. Applied on proxy startup",
+        description="how often (in seconds) each pod reloads config-in-DB objects (models, credentials, guardrails, etc.) when store_model_in_db is enabled; also the interval of the config-file hot-reload poll (config.yaml + script fingerprint, incl. DB-less deployments). Lower values speed up multi-pod convergence and hot-reload pickup at the cost of more DB/file polling. Applied on proxy startup",
     )
     cancel_on_disconnect: bool | None = Field(
         None,

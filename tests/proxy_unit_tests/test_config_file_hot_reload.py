@@ -230,6 +230,47 @@ def test_dbless_startup_schedules_config_reload_poll(client_custom_auth_no_admin
 
 
 @pytest.fixture(scope="function")
+def client_custom_auth_reload_interval(tmp_path, monkeypatch):
+    config_path = os.path.join(tmp_path, "config.yaml")
+    with open(os.path.join(tmp_path, "custom_auth.py"), "w") as f:
+        f.write(_no_admin_script(("sk-user-bob-key-456",)))
+    with open(config_path, "w") as f:
+        f.write(
+            _config_yaml(custom_auth="custom_auth.user_api_key_auth")
+            + "  proxy_config_reload_interval_seconds: 7\n"
+        )
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
+    asyncio.run(initialize(config=config_path, debug=True))
+    return TestClient(app)
+
+
+def test_reload_poll_interval_configurable_via_config_yaml(
+    client_custom_auth_reload_interval,
+):
+    """general_settings.proxy_config_reload_interval_seconds in config.yaml
+    flows through load_config into the DB-less reload poll's schedule."""
+    from datetime import timedelta
+
+    import litellm.proxy.proxy_server as ps
+
+    assert ps.proxy_config_reload_interval_seconds == 7
+
+    async def _run() -> None:
+        await ps.ProxyStartupEvent._initialize_config_file_reload_job()
+        try:
+            assert ps.scheduler is not None
+            job = ps.scheduler.get_job("config_file_reload_job")
+            assert job is not None
+            assert job.trigger.interval == timedelta(seconds=7)
+        finally:
+            if ps.scheduler is not None:
+                ps.scheduler.shutdown(wait=False)
+                ps.scheduler = None
+
+    asyncio.run(_run())
+
+
+@pytest.fixture(scope="function")
 def client_importable_custom_auth(tmp_path, monkeypatch):
     """custom_auth module importable via sys.path (e.g. PYTHONPATH=/app in
     the Docker images), living away from the config file."""
