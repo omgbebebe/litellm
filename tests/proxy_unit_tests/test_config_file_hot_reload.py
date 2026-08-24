@@ -129,6 +129,106 @@ def client_master_key(tmp_path, monkeypatch):
     return TestClient(app), config_path
 
 
+SCRIPT_NO_ADMIN = """\
+from fastapi import Request, HTTPException
+from litellm.proxy._types import UserAPIKeyAuth
+
+STATIC_TOKENS = {}
+
+async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
+    if api_key in STATIC_TOKENS:
+        return UserAPIKeyAuth(api_key=api_key, user_id=api_key)
+    raise HTTPException(status_code=401, detail="Invalid Static API Key")
+"""
+
+
+def _no_admin_script(tokens: tuple[str, ...]) -> str:
+    table = "\n".join(f'    "{t}": {{"user_id": "{t}"}},' for t in tokens)
+    return SCRIPT_NO_ADMIN.replace("STATIC_TOKENS = {}", f"STATIC_TOKENS = {{\n{table}\n}}")
+
+
+@pytest.fixture(scope="function")
+def client_custom_auth_no_admin(tmp_path, monkeypatch):
+    """The documented static-token setup with no database and no admin token
+    in the table: neither the DB-gated poll nor the admin-gated
+    /reload/config_file endpoint can trigger a reload — only the DB-less
+    poll job can."""
+    config_path = os.path.join(tmp_path, "config.yaml")
+    with open(os.path.join(tmp_path, "custom_auth.py"), "w") as f:
+        f.write(_no_admin_script(("sk-user-bob-key-456",)))
+    with open(config_path, "w") as f:
+        f.write(_config_yaml(custom_auth="custom_auth.user_api_key_auth"))
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
+    asyncio.run(initialize(config=config_path, debug=True))
+    return TestClient(app), os.path.join(tmp_path, "custom_auth.py")
+
+
+def test_dbless_custom_auth_picks_up_script_edit_via_poll(
+    client_custom_auth_no_admin,
+):
+    """DB-less deployment: editing custom_auth.py is picked up by the
+    scheduled check_config_file_reload poll without a restart and without
+    any admin credential."""
+    import litellm.proxy.proxy_server as ps
+
+    client, script_path = client_custom_auth_no_admin
+
+    assert _auth_passed(
+        client.post(
+            "/chat/completions",
+            json=CHAT_BODY,
+            headers={"Authorization": "Bearer sk-user-bob-key-456"},
+        )
+    )
+
+    with open(script_path, "w") as f:
+        f.write(_no_admin_script(("sk-user-carol-key-789",)))
+
+    # the exact coroutine the scheduler invokes on every poll tick
+    outcome = asyncio.run(ps.proxy_config.check_config_file_reload())
+    assert outcome.reloaded is True
+    assert outcome.applied_scripts == ["custom_auth"]
+    assert outcome.fatal_error is None
+
+    assert _auth_passed(
+        client.post(
+            "/chat/completions",
+            json=CHAT_BODY,
+            headers={"Authorization": "Bearer sk-user-carol-key-789"},
+        )
+    )
+    assert (
+        client.post(
+            "/chat/completions",
+            json=CHAT_BODY,
+            headers={"Authorization": "Bearer sk-user-bob-key-456"},
+        ).status_code
+        == 401
+    )
+
+
+def test_dbless_startup_schedules_config_reload_poll(client_custom_auth_no_admin):
+    """proxy_startup_event must register the config-file reload job even
+    without a database, or the poll never ticks. Start and shutdown share
+    one asyncio.run: the AsyncIO scheduler keeps a reference to the loop it
+    started on."""
+    import litellm.proxy.proxy_server as ps
+
+    async def _run() -> None:
+        await ps.ProxyStartupEvent._initialize_config_file_reload_job()
+        try:
+            assert ps.scheduler is not None
+            job = ps.scheduler.get_job("config_file_reload_job")
+            assert job is not None
+            assert job.func == ps.proxy_config.check_config_file_reload
+        finally:
+            if ps.scheduler is not None:
+                ps.scheduler.shutdown(wait=False)
+                ps.scheduler = None
+
+    asyncio.run(_run())
+
+
 @pytest.fixture(scope="function")
 def client_importable_custom_auth(tmp_path, monkeypatch):
     """custom_auth module importable via sys.path (e.g. PYTHONPATH=/app in

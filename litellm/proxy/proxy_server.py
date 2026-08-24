@@ -1261,6 +1261,12 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[None, None]:
         if prisma_client is not None
         else None
     )
+    if prisma_client is None:
+        # DB-less deployments still poll the config source for hot reload:
+        # without a scheduler there is no poll, and the manual
+        # /reload/config_file endpoint is admin-gated — unusable with a
+        # static token table
+        await ProxyStartupEvent._initialize_config_file_reload_job()
     if prisma_client is not None:
         await ProxyStartupEvent._update_default_team_member_budget()
 
@@ -9275,6 +9281,45 @@ class ProxyStartupEvent:
                     )
         except Exception as e:
             verbose_proxy_logger.debug("UI settings sync on startup skipped or failed: %s", e)
+
+    @classmethod
+    async def _initialize_config_file_reload_job(cls) -> None:
+        """Schedule only the config-file hot-reload poll, for DB-less
+        deployments (e.g. static-token custom_auth): the full scheduler setup
+        in initialize_scheduled_background_jobs is gated on prisma_client, so
+        without this the poll never starts and the admin-gated
+        /reload/config_file endpoint is the only trigger — one a static
+        token table cannot authenticate."""
+        global scheduler
+        from apscheduler.executors.asyncio import AsyncIOExecutor
+        from apscheduler.jobstores.memory import MemoryJobStore
+
+        scheduler = AsyncIOScheduler(
+            job_defaults={
+                "coalesce": APSCHEDULER_COALESCE,
+                "misfire_grace_time": APSCHEDULER_MISFIRE_GRACE_TIME,
+                "max_instances": APSCHEDULER_MAX_INSTANCES,
+            },
+            jobstores={"default": MemoryJobStore()},
+            executors={"default": AsyncIOExecutor()},
+            timezone=None,
+        )
+        interval_seconds = proxy_config_reload_interval_seconds
+        if not isinstance(interval_seconds, int) or interval_seconds <= 0:
+            interval_seconds = 30
+        scheduler.add_job(
+            proxy_config.check_config_file_reload,
+            "interval",
+            seconds=interval_seconds,
+            id="config_file_reload_job",
+            replace_existing=True,
+            misfire_grace_time=APSCHEDULER_MISFIRE_GRACE_TIME,
+        )
+        scheduler.start(paused=False)
+        verbose_proxy_logger.info(
+            "Config file hot-reload poll scheduled (DB-less mode) at %ss intervals",
+            interval_seconds,
+        )
 
     @classmethod
     async def initialize_scheduled_background_jobs(
