@@ -147,6 +147,18 @@ def append_static_token(script_source: str, token: str, username: str) -> str:
     # matching the indentation of the last entry line
     tokens.keys.append(ast.Constant(value=token))
     tokens.values.append(entry)
+
+    # the previously-last entry may lack a trailing comma (legal python,
+    # e.g. the closing-brace style); patch one in at its AST end position —
+    # after the code, before any trailing comment — or the inserted line
+    # below would produce invalid syntax
+    previous_last = tokens.values[-2]
+    last_line = cast("int", previous_last.end_lineno) - 1
+    last_col = cast("int", previous_last.end_col_offset)
+    remainder: Final = lines[last_line][last_col:]
+    if "," not in remainder.split("#", 1)[0]:
+        lines[last_line] = lines[last_line][:last_col] + "," + lines[last_line][last_col:]
+
     close_index = cast("int", assign_value.end_lineno) - 1  # cast-ok: end_lineno is always set for parsed nodes
     indent: Final = _leading_whitespace(lines[close_index - 1])
     insert: Final = f'{indent}"{token}": {entry_src},\n'

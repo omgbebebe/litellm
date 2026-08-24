@@ -156,3 +156,42 @@ def test_append_inserts_with_entry_indentation():
     updated = append_static_token(SCRIPT, token="sk-carol-new", username="carol")
     inserted = next(line for line in updated.splitlines() if "sk-carol-new" in line)
     assert inserted.startswith(" " * 4 + '"sk-carol-new"')  # 4-space indent like the entries
+
+
+def test_append_patches_missing_trailing_comma_on_last_entry():
+    """The closing-brace style (no comma after the last entry) must not
+    produce invalid syntax when a new line is inserted below it."""
+    source = textwrap.dedent(
+        """\
+        STATIC_TOKENS = {
+            "sk-a": {"user_id": "alice", "max_budget": 100.0},
+            "sk-b": {"user_id": "bob", "max_budget": 100.0}
+        }
+        """
+    )
+    updated = append_static_token(source, token="sk-carol-new", username="carol")
+    ast.parse(updated)  # must be valid python
+    assert static_token_usernames(updated) == ("alice", "bob", "carol")
+    assert '    "sk-b": {"user_id": "bob", "max_budget": 100.0},\n' in updated
+
+
+def test_append_patches_comma_before_trailing_comment_on_last_entry():
+    source = textwrap.dedent(
+        """\
+        STATIC_TOKENS = {
+            "sk-a": {"user_id": "alice", "max_budget": 100.0},   # first
+            "sk-b": {"user_id": "bob", "max_budget": 100.0}   # last, no comma
+        }
+        """
+    )
+    updated = append_static_token(source, token="sk-carol-new", username="carol")
+    ast.parse(updated)
+    assert '    "sk-b": {"user_id": "bob", "max_budget": 100.0},   # last, no comma\n' in updated
+    assert static_token_usernames(updated) == ("alice", "bob", "carol")
+
+
+def test_append_keeps_existing_trailing_comma():
+    updated = append_static_token(SCRIPT, token="sk-carol-new", username="carol")
+    bob_line = next(line for line in updated.splitlines() if "sk-user-bob-key-456" in line)
+    assert bob_line.rstrip().endswith(",")
+    assert bob_line.count(",") == 2  # max_budget trailing comma + entry comma
